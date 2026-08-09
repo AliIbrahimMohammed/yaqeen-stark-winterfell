@@ -1,0 +1,15 @@
+[package]
+name = "title_air"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+winterfell = { path = "../facade" }
+
+[[bin]]
+name = "e2e_harness"
+path = "src/bin/e2e_harness.rs"
+
+[[bin]]
+name = "fuzz_harness"
+path = "src/bin/fuzz_harness.rs"

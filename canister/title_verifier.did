@@ -1,0 +1,61 @@
+type ChallengeView = record {
+  request_nonce : nat64;
+  merkle_root : text;
+  registry_id : nat64;
+  challenge_id : nat64;
+  expires_at : int64;
+  current_timestamp : nat64;
+  purpose : nat64;
+};
+type MerkleProof = record {
+  root : text;
+  leaf_index : nat64;
+  path_bits : vec bool;
+  siblings : vec text;
+};
+type Record = record {
+  license_expiry : nat64;
+  license_status : nat64;
+  property_id : nat64;
+  encumbrance_flag : nat64;
+  // Poseidon-analog owner commitment, computed OFF-canister -- the
+  // canister never learns `owner_secret`. Decimal string, field element.
+  owner_commitment : text;
+};
+type Result = variant { Ok; Err : text };
+type Result_1 = variant { Ok : ChallengeView; Err : text };
+type Result_2 = variant { Ok : text; Err : text };
+type Result_3 = variant { Ok : VerifyOk; Err : text };
+type VerifyOk = record { nullifier : text };
+type VerifyPublicInputs = record {
+  request_nonce : nat64;
+  nullifier : text;
+  merkle_root : text;
+  registry_id : nat64;
+  current_timestamp : nat64;
+  purpose : nat64;
+};
+service : () -> {
+  add_admin : (principal) -> (Result);
+  // One-time bootstrap: succeeds only while there are no admins yet. See
+  // `main.mo`'s `bootstrapAdmin` for the full rationale (no constructor
+  // arguments available; this is the runtime equivalent). Call this in the
+  // SAME deploy session, before the canister id is shared.
+  bootstrap_admin : (principal) -> (Result);
+  get_merkle_proof : (nat64) -> (opt MerkleProof) query;
+  get_record : (nat64) -> (opt Record) query;
+  health : () -> (text) query;
+  remove_admin : (principal) -> (Result);
+  request_challenge : (nat64) -> (Result_1);
+  // Admin-only back-office write, gated the same way `submitRecord` is in
+  // `main.mo`. Resubmitting an existing `property_id` UPDATES that
+  // property's existing leaf in place (same fix as
+  // `PATCH_NOTES-leaf-update-and-hardening.md`).
+  submit_record : (nat64, text, nat64, nat64, nat64) -> (Result_2);
+  // Verifies a Winterfell STARK proof on-chain and, on success, marks the
+  // challenge consumed and the nullifier spent. Declared as an `update`
+  // call, not a `query` -- same reasoning as
+  // `ic-winterfell-verifier/canister`: query calls aren't certified by
+  // subnet consensus, which defeats the point.
+  verify : (nat64, blob, VerifyPublicInputs) -> (Result_3);
+}

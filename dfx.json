@@ -1,0 +1,11 @@
+{
+  "canisters": {
+    "title_verifier": {
+      "type": "rust",
+      "package": "title_verifier",
+      "candid": "canister/title_verifier.did"
+    }
+  },
+  "output_env_file": ".env",
+  "version": 1
+}

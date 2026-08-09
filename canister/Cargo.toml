@@ -1,0 +1,23 @@
+[package]
+name = "title_verifier"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ic-cdk = "0.20.2"
+candid = "0.10.34"
+serde = { version = "1.0", features = ["derive"] }
+
+# Shared AIR + hash definition -- MUST be the exact same one the off-chain
+# prover links against (see ../prover), or every proof will be rejected,
+# and the registry's own Merkle bookkeeping uses the same `hash()` so its
+# `currentRoot` can never drift from what the AIR expects at `merkle_root`.
+title_air = { path = "../air" }
+
+# Do NOT enable "concurrent" -- see title_air/canister rationale in
+# ic-winterfell-verifier: rayon spawns OS threads, unavailable in a
+# canister's single-threaded WASM sandbox.
+winterfell = { version = "0.13.1", default-features = true }

@@ -1,0 +1,11 @@
+[package]
+name = "title_prover"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+title_air = { path = "../air" }
+
+# Off-chain: multi-threaded proving is a pure win here, unlike in the
+# canister.
+winterfell = { version = "0.13.1", features = ["concurrent"] }

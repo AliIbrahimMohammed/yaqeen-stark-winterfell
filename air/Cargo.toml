@@ -1,0 +1,12 @@
+[package]
+name = "title_air"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Same rationale as ic-winterfell-verifier/air: no feature choice here on
+# purpose. The AIR (and the plain hash/permutation helpers below it) is
+# linked identically into the canister (single-threaded) and the off-chain
+# prover (optionally multi-threaded) -- each downstream crate picks its own
+# winterfell features.
+winterfell = { version = "0.13.1", default-features = false, features = ["std"] }

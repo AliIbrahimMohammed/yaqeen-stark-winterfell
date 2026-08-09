@@ -1,0 +1,3 @@
+[workspace]
+resolver = "2"
+members = ["facade", "air_test"]
