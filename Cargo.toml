@@ -6,4 +6,14 @@ members = ["air", "canister", "prover"]
 opt-level = 3
 lto = true
 codegen-units = 1
-panic = "abort"
+# `unwind`, not `abort`: canister/src/lib.rs wraps the call into
+# `winterfell::verify` in `std::panic::catch_unwind` so a structurally
+# malformed (not just cryptographically invalid) proof returns Err(..)
+# instead of trapping the whole `update` call. Under panic=abort,
+# catch_unwind is a silent no-op and this hardening does nothing -- wasm32
+# targets have supported real unwinding for long enough that this trade
+# (slightly larger binary, unwind tables) is worth it for a security-
+# relevant boundary like proof verification. The prover binary (a native,
+# not wasm, target) is unaffected either way -- unwind is Rust's normal
+# default there.
+panic = "unwind"

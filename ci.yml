@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: cargo test (workspace)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # Unit tests for title_air (AIR constraints) and title_verifier
+      # (canister business logic, run against the `_impl` functions --
+      # see the TESTABILITY NOTE at the top of canister/src/lib.rs).
+      - name: cargo test --workspace
+        run: cargo test --workspace --locked
+
+  fuzz:
+    name: AIR fuzz harness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: test-harness -> target
+
+      # test-harness/air_test/src/bin/fuzz_harness.rs already exists and
+      # exits non-zero on any panic/OOB found while hammering
+      # evaluate_transition with arbitrary (non-satisfying) trace rows --
+      # this was written but never actually run in CI. `cargo run`
+      # surfaces its own build errors AND a non-zero process exit (the
+      # harness's explicit `std::process::exit(1)` on `panics > 0`) as a
+      # failed step either way.
+      - name: Run AIR transition-constraint fuzz harness
+        working-directory: test-harness
+        run: cargo run --locked --bin fuzz_harness
+
+      # Complements the AIR-level fuzzing above by hammering the
+      # *canister's* proof-decode boundary (Proof::from_bytes /
+      # winterfell::verify) and malformed-public-input-string parsing
+      # with thousands of random byte payloads -- these live as ordinary
+      # #[test]s in canister/src/lib.rs (see
+      # verify_crypto_fuzz_never_panics_on_random_proof_bytes and
+      # verify_precheck_fuzz_malformed_public_input_strings_never_panic)
+      # so they already run as part of the `test` job above; called out
+      # here just so a reader of this workflow can find them.
+      - name: (canister proof-decode fuzz tests run in the `test` job above)
+        run: echo "see verify_crypto_fuzz_* and verify_precheck_fuzz_* in canister/src/lib.rs"

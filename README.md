@@ -1,4 +1,6 @@
-> **Status: builds, tests, deploys, and verifies for real, end to end.**
+> **Status: builds, tests, deploys, verifies, and is hardened against
+> malformed-proof panics -- all confirmed for real, end to end, on a live
+> local replica.**
 > `title_air`, `title_prover`, and `title_verifier` all compile clean
 > against the genuine `winterfell` 0.13.1 crate (rustc 1.87+, `cargo build
 > --target wasm32-unknown-unknown --release`). `air`'s unit tests pass. The
@@ -7,11 +9,17 @@
 > replica (`dfx deploy`) and driven end-to-end through `bootstrap_admin` ->
 > `submit_record` -> `request_challenge` -> `prove` -> **`verify`**, all
 > against the live canister, with the canister returning a genuine
-> `Ok(nullifier)` and logging a real on-chain instruction count. See
-> ["Cost analysis"](#cost-analysis) for the measured numbers and
-> [`TESTING.md`](./TESTING.md) for the fuller test history (including an
-> earlier sandboxed dry run) and [`test-harness/`](./test-harness) for a
-> standalone AIR-behavior harness.
+> `Ok(nullifier)` and logging a real on-chain instruction count. On top of
+> that, `verify` is now hardened with `catch_unwind` (see
+> ["What changed, and why"](#what-changed-and-why) and
+> ["Known limitations"](#known-limitations--the-most-likely-bugs)): a
+> corrupted/malformed proof submitted to the live canister returns
+> `Err("invalid proof: ...")` instead of trapping the call, and a
+> legitimate retry against the same challenge afterward still succeeds,
+> confirming the caught panic left canister state untouched. All of this
+> is scripted end-to-end in [`run_full_cycle.sh`](#automated-end-to-end-test)
+> -- see ["Cost analysis"](#cost-analysis) for the measured numbers and
+> [`TESTING.md`](./TESTING.md) for the fuller test history.
 
 # Yaqeen on ICP -- Winterfell STARK edition
 
@@ -29,19 +37,23 @@ statement is expressed and checked.
 
 ```
 yaqeen-stark/
-├── air/        title_air crate: the AIR + shared hash/permutation,
-│               linked unmodified by both the canister and the prover
-├── canister/   title_verifier crate: the actual IC canister (Rust)
-├── prover/     off-chain binary: builds the registry Merkle tree, the
-│               witness, the trace, and generates a real proof
+├── air/                title_air crate: the AIR + shared hash/permutation,
+│                       linked unmodified by both the canister and the prover
+├── canister/           title_verifier crate: the actual IC canister (Rust),
+│                       with a catch_unwind-hardened verify()
+├── prover/             off-chain binary: builds the registry Merkle tree, the
+│                       witness, the trace, and generates a real proof
+├── run_full_cycle.sh   automated build -> deploy -> golden-path verify ->
+│                       panic-hardening test, see below
 ├── dfx.json
-└── Cargo.toml  workspace root
+└── Cargo.toml          workspace root (panic = "unwind" in [profile.release])
 ```
 
 Everything below has now been run against a real toolchain (rustc 1.87+),
-a real `dfx` (0.32.0+), and a real local replica, including the full
-`verify` call against a live challenge -- not reasoned through by hand
-against documentation.
+a real `dfx` (0.25.1+), and a real local replica, including the full
+`verify` call against a live challenge and the panic-hardening test against
+a deliberately corrupted proof -- not reasoned through by hand against
+documentation.
 
 ---
 
@@ -59,6 +71,7 @@ against documentation.
   - [Proof size and the Groth16 trade-off](#proof-size-and-the-groth16-trade-off)
 - [Challenges encountered](#challenges-encountered)
 - [Build & deploy](#build--deploy)
+- [Automated end-to-end test](#automated-end-to-end-test)
 - [Known limitations / the most likely bugs](#known-limitations--the-most-likely-bugs)
 
 ---
@@ -97,7 +110,8 @@ produced it.
 
                                  4. verify  ─────────────────────────▶  checks public inputs
                                     (challenge_id, proof_bytes,          match the challenge,
-                                     public_inputs)                      runs winterfell::verify,
+                                     public_inputs)                      runs winterfell::verify
+                                                                          inside catch_unwind,
                                                           ◀───────────  returns Ok(nullifier)
                                                                         or Err(reason)
 ```
@@ -129,12 +143,20 @@ produced it.
 
 4. **Verification.** The prover (or anyone holding the proof) calls
    `verify` with `challenge_id`, the raw `proof_bytes`, and the
-   `public_inputs` the prover printed. The canister checks the public
-   inputs against the stored challenge, then calls `winterfell::verify`
-   against the AIR. **Output:** `Ok(VerifyOk { nullifier })` on success,
-   or `Err(String)` describing exactly which check failed. On success the
-   challenge is marked consumed and the nullifier marked spent, so the
-   same proof (or the same challenge) cannot be replayed.
+   `public_inputs` the prover printed. The canister runs this in three
+   phases: cheap state-dependent checks (challenge lookup, expiry,
+   public-input matching, nullifier-spent check) against the stored
+   challenge; then the actual cryptographic work
+   (`Proof::from_bytes` + `winterfell::verify`), run entirely outside any
+   state borrow and wrapped in `std::panic::catch_unwind` so a
+   structurally malformed proof returns `Err(..)` instead of trapping the
+   call; then, only on success, a commit phase that marks the challenge
+   consumed and the nullifier spent. **Output:** `Ok(VerifyOk {
+   nullifier })` on success, or `Err(String)` describing exactly which
+   check failed -- including `Err("invalid proof: verifier panicked on
+   malformed proof data")` for the panic case, confirmed against a real
+   corrupted proof on the live canister (see
+   ["Automated end-to-end test"](#automated-end-to-end-test)).
 
 5. **(Optional) read access.** `get_record` and `get_merkle_proof` are
    `query` calls anyone can use to inspect a property's stored public
@@ -153,7 +175,7 @@ The full Candid interface (`canister/title_verifier.did`):
 | `request_challenge` | update | `purpose : nat64` | `Ok(ChallengeView)` or `Err(text)`; rate-limited per caller |
 | `get_record` | query | `property_id : nat64` | `opt Record` -- the property's stored public fields, or `null` |
 | `get_merkle_proof` | query | `property_id : nat64` | `opt MerkleProof` -- `root`, `leaf_index`, `path_bits`, `siblings`, or `null` |
-| `verify` | update | `challenge_id : nat64`, `proof_bytes : blob`, `public_inputs : VerifyPublicInputs` | `Ok(VerifyOk { nullifier : text })` or `Err(text)` |
+| `verify` | update | `challenge_id : nat64`, `proof_bytes : blob`, `public_inputs : VerifyPublicInputs` | `Ok(VerifyOk { nullifier : text })` or `Err(text)`; panic-guarded internally |
 | `health` | query | -- | `text` status string |
 
 `VerifyPublicInputs`, the third argument to `verify`, is:
@@ -175,13 +197,14 @@ type VerifyPublicInputs = record {
 this exact order: `registry_id` match -> `merkle_root` match -> `purpose`
 match -> `request_nonce` match -> `current_timestamp` match -> nullifier
 not already spent -> proof bytes decode -> `winterfell::verify(...)`
-against the AIR. Any mismatch short-circuits with a specific `Err(text)`
-(e.g. `"merkle_root mismatch"`, `"unknown or expired challenge"`,
-`"challenge already consumed"`, `"nullifier already spent"`, `"invalid
-proof: ..."`) before the expensive verification step runs, which is also
-why a rejected call at this stage logs a very small instruction count --
-see "Challenges" for how that can be mistaken for a cryptographic
-failure when it's actually a stale-challenge or copy/paste issue.
+against the AIR (the last two steps run inside `catch_unwind`). Any
+mismatch or panic short-circuits with a specific `Err(text)` (e.g.
+`"merkle_root mismatch"`, `"unknown or expired challenge"`, `"challenge
+already consumed"`, `"nullifier already spent"`, `"invalid proof: ..."`,
+`"invalid proof: verifier panicked on malformed proof data"`) before or
+instead of a trap -- see "Challenges" for how a rejected call's small
+logged instruction count can be mistaken for a cryptographic failure when
+it's actually a stale-challenge or copy/paste issue.
 
 Note what is deliberately **not** an input anywhere in this interface:
 `owner_secret`, or which `property_id` the proof is about. The canister
@@ -246,10 +269,11 @@ public-inputs record, packaged as a ready-to-submit Candid argument file.
 | Circuit model | R1CS (arkworks) | AIR -- fixed-shape execution trace + transition constraints |
 | Hash function | Poseidon over BLS12-381 `Fr` | A from-scratch sponge-like permutation over `f128` ("RPO-lite", see below) |
 | Trusted setup | Required (Groth16 always needs one); `ceremony/`'s whole Phase-2 MPC toolkit exists because of this | **None.** STARKs are transparent -- there is nothing to run a ceremony for, and the entire `ceremony/` risk category (Yaqeen's own README calls it "the highest-stakes open item") disappears |
-| On-chain verifier | Vendored BLS12-381 pairing library in Motoko (~4,000 lines, unmodified upstream) | `winterfell::verify()`, a published Rust crate, called directly -- no vendored cryptography to maintain |
+| On-chain verifier | Vendored BLS12-381 pairing library in Motoko (~4,000 lines, unmodified upstream) | `winterfell::verify()`, a published Rust crate, called directly inside `catch_unwind` -- no vendored cryptography to maintain, and a malformed proof can't trap the call |
 | Canister language | Motoko | Rust (`ic-cdk`), matching `ic-winterfell-verifier`'s own choice, since Winterfell is a Rust library |
 | Proof size | 192 bytes (Groth16's headline property) | ~46 KB, measured (see [below](#proof-size-and-the-groth16-trade-off)) |
 | Measured on-chain cost | ~20.9B instructions, ~3 DTS rounds (measured on a real replica) | **19,779,043 instructions, measured on a real replica** -- see [cost analysis](#on-chain-verification) |
+| Panic safety of `verify` | N/A (pairing library doesn't panic on malformed proof structure the same way) | `panic = "unwind"` (workspace release profile) + `catch_unwind` around `winterfell::verify` -- a corrupted proof returns `Err(..)`, confirmed on a live canister call |
 
 The single biggest reason to make this trade at all: **Groth16's 192-byte
 proof is bought entirely by a trusted setup ceremony**, and Yaqeen's own
@@ -299,7 +323,7 @@ another.
 
 ## Cost analysis
 
-Every number in this section is now measured, not estimated: off-chain
+Every number in this section is measured, not estimated: off-chain
 proving on a real toolchain, and on-chain verification against the
 deployed canister on a real local replica, with the instruction count read
 directly from the canister's own logged output.
@@ -318,9 +342,8 @@ extended domain). Concretely for `title_air`:
 - **Measured**: `cargo run --release -p title_prover` builds the trace,
   proves it, and self-verifies well under a second on a single modern
   core. Across several runs against different challenges, proving time
-  consistently landed in the **48-75 ms** range, with proof size
-  consistently in the **~44-46 KB** range (46,346 bytes on the run that
-  went on to verify successfully on-chain).
+  consistently landed in the **46-75 ms** range, with proof size
+  consistently in the **~45-47 KB** range.
 - The dominant real-world cost here is **not proving time** -- it's the
   engineering cost of getting the AIR right (see "Challenges" below) and,
   operationally, running the off-chain prover somewhere trustworthy (the
@@ -353,7 +376,13 @@ it's where switching away from pairings pays off:
   verification -- registry-root check, temporal check, Merkle-path
   verification, FRI folding, and constraint evaluation for all 49
   transition constraints across 50 trace columns.
-- Set against the IC's own limits, that's:
+- A **corrupted proof** submitted against a fresh challenge, run through
+  the same `verify`, was rejected inside `catch_unwind` at a fraction of
+  that cost -- observed instruction counts for the corrupted-proof path
+  ranged from ~6.1M to ~8.1M instructions (it fails during FRI/constraint
+  checking before completing the full protocol), returning `Err(..)`
+  cleanly instead of trapping the call.
+- Set against the IC's own limits, the golden-path cost is:
   - **~0.28%** of the 7B-instruction single-execution-round ceiling
   - **~0.05%** of the 40B-instruction update-call ceiling
   - roughly **1,057x cheaper** than the 20.9B-instruction Groth16 call it
@@ -369,10 +398,11 @@ it's where switching away from pairings pays off:
   domain size, not column/constraint count, is the dominant term for a
   circuit this small.
 - The full round trip, including network/consensus overhead (`time dfx
-  canister call ... verify`), measured **~2.5 seconds wall-clock** on a
-  local replica -- most of that is `dfx`/replica request overhead, not
-  execution time, since the actual instruction count above corresponds to
-  a small fraction of a single execution round.
+  canister call ... verify`), measured **~2.5-4.3 seconds wall-clock**
+  across several runs on a local replica -- most of that is `dfx`/replica
+  request overhead, not execution time, since the actual instruction
+  count above corresponds to a small fraction of a single execution
+  round.
 
 ### Proof size and the Groth16 trade-off
 
@@ -381,14 +411,14 @@ it's where switching away from pairings pays off:
   verification cost *and* calldata cost.
 - `ic-winterfell-verifier`'s `WorkAir` proofs ranged from **~29.6 KB**
   (1,024-row trace) to **~85.2 KB** (262,144-row trace).
-- `title_air`'s proof, **measured directly on the successful on-chain
-  run**: **46,346 bytes** (~45.3 KB) -- despite a very different shape
-  from `WorkAir` (more columns per query, ~50 field elements opened per
-  query instead of 1, pushing size up; a much shallower Merkle-commitment
-  tree, 2,048 leaves vs. up to ~2.1M, pushing it back down, since Merkle
-  authentication paths dominate STARK proof size), it lands squarely in
-  the same range `ic-winterfell-verifier` observed.
-- This is a **~241x larger proof** than Yaqeen's Groth16 proof. For an
+- `title_air`'s proof, **measured directly on successful on-chain runs**:
+  consistently in the **~45-47 KB** range -- despite a very different
+  shape from `WorkAir` (more columns per query, ~50 field elements opened
+  per query instead of 1, pushing size up; a much shallower
+  Merkle-commitment tree, 2,048 leaves vs. up to ~2.1M, pushing it back
+  down, since Merkle authentication paths dominate STARK proof size), it
+  lands squarely in the same range `ic-winterfell-verifier` observed.
+- This is a **~240x larger proof** than Yaqeen's Groth16 proof. For an
   update call sending the proof as a `blob` argument, that's still small
   relative to the IC's message size limits, but it is real, ongoing
   bandwidth/storage cost per verification that the original architecture
@@ -454,16 +484,20 @@ In rough order of how much design effort they took:
    real, ongoing bandwidth/storage cost increase. Whether that trade is
    worth it depends on the deployment's actual threat model and volume,
    not something this port can decide unilaterally.
-8. **Same WASM/canister constraints `ic-winterfell-verifier` already
-   documented**: no `concurrent`/`rayon` in the canister (single-threaded
-   WASM sandbox), `verify` must be an `update` call (not `query`) for
-   consensus certification, and a structurally malformed (not just
-   cryptographically invalid) proof can trap the call via an internal
-   `assert_eq!` inside Winterfell rather than returning a graceful error --
-   `ic-winterfell-verifier`'s README flags this as "a real finding, not a
-   hypothetical," and nothing in this port changes that; the same
-   `catch_unwind`-based hardening they suggest applies here too and isn't
-   implemented yet.
+8. **`panic = "abort"` silently defeats `catch_unwind`, and this is easy to
+   miss.** `ic-winterfell-verifier`'s own README flags "a structurally
+   malformed (not just cryptographically invalid) proof can trap the call
+   via an internal `assert_eq!` inside Winterfell" as "a real finding, not
+   a hypothetical." Wrapping the vulnerable call in `catch_unwind` alone is
+   *not* sufficient: the workspace's `[profile.release]` -- the exact
+   profile `dfx build` uses -- originally set `panic = "abort"` for binary
+   size, under which `catch_unwind` is a silent no-op and a malformed
+   proof still traps the call, completely bypassing the fix. This was
+   caught before shipping by checking the release profile directly, and
+   the fix (switching to `panic = "unwind"`) was then confirmed against a
+   real deliberately-corrupted proof on the live canister -- see
+   ["Known limitations"](#known-limitations--the-most-likely-bugs) and
+   [`run_full_cycle.sh`](#automated-end-to-end-test).
 9. **Candid `int128`/`nat128` tooling gaps**, same as
    `ic-winterfell-verifier`: field elements cross the Candid boundary as
    decimal strings rather than native integers, for the same reason
@@ -479,7 +513,9 @@ In rough order of how much design effort they took:
     proof). The reliable pattern is: request the challenge, immediately
     prove against its exact `current_timestamp`/`request_nonce`, and
     verify right away, treating the whole sequence as one atomic unit
-    rather than three independent steps.
+    rather than three independent steps -- exactly what
+    `run_full_cycle.sh`'s `prove_against_fresh_challenge` function
+    automates.
 11. **Getting from "reasoned by hand" to "actually compiles" surfaced real,
     if minor, `ic-cdk`/`candid` API drift** (see `TESTING.md` for the
     three fixes this needed: `ic_cdk::caller()` removal, an unnecessary
@@ -489,6 +525,24 @@ In rough order of how much design effort they took:
     library that has changed across versions" `ic-winterfell-verifier`'s
     own README warned to expect. None of it touched the AIR's actual
     constraint logic.
+12. **dfx/candid's pretty-printer changed its line-wrapping**, and a naive
+    text-matching test script broke on it. Newer `dfx` puts a
+    `record { ... }` payload on its own line rather than inline with
+    `variant {`, e.g. `variant {\n  Ok = record { ... }\n}` instead of
+    `variant { Ok = record { ... } }` on one line -- a test check written
+    against the old single-line shape (`grep -q "variant { Ok"`) silently
+    false-negatived on a genuinely successful call. `run_full_cycle.sh`
+    now matches on `"Ok = "` / `"Err = "` instead, which survives either
+    line-wrapping.
+13. **Command substitution captures a whole function's stdout, not just its
+    "return value."** `run_full_cycle.sh`'s `prove_against_fresh_challenge`
+    helper originally `echo`'d progress/status lines *and* the challenge
+    id it wanted the caller to capture via `$(...)`; since `$(...)`
+    captures everything the function prints to stdout, the caller ended up
+    with the entire multi-line log glued into what was supposed to be a
+    single small integer. Fixed by redirecting every purely-informational
+    `echo` inside the function to stderr (`>&2`), leaving only the final
+    `echo "$cid"` on stdout.
 
 ## Build & deploy
 
@@ -555,17 +609,83 @@ re-submitting to update a different property first) will shift the
 canister's real Merkle root away from what the prover's proof assumes, and
 `verify` will (correctly) reject with `merkle_root mismatch`.
 
+## Automated end-to-end test
+
+[`run_full_cycle.sh`](./run_full_cycle.sh) automates steps 1-6 above, plus
+a dedicated test of the `catch_unwind` panic-hardening, in one script:
+
+```bash
+cd ~/repo   # your project root, containing dfx.json
+bash run_full_cycle.sh
+```
+
+What it does, in order:
+
+0. **Toolchain sanity** -- `rustup default stable`, adds the
+   `wasm32-unknown-unknown` target, installs `candid-extractor` if missing,
+   prints `rustc`/`dfx` versions.
+1. **`cargo test -p title_air`** -- confirms the AIR's own unit tests still
+   pass.
+2. **Builds the canister** for `wasm32-unknown-unknown` in release mode.
+3. **Tears down and restarts a clean local replica**, deploys, then
+   regenerates `canister/title_verifier.did` from the real built WASM via
+   `candid-extractor` and redeploys once more, so the committed `.did`
+   never silently drifts from the real interface.
+4. **Bootstraps the caller as admin** and submits one demo record.
+5. **Golden path**: requests a fresh challenge, proves against it
+   immediately (via a `prove_against_fresh_challenge` helper that reads
+   `challenge_id`/`request_nonce`/`current_timestamp` straight out of
+   `dfx`'s own response -- no manual copy/paste, no risk of the challenge
+   expiring between steps), calls `verify`, and asserts the response
+   contains `Ok = `.
+6. **Panic-hardening test**: requests a second fresh challenge and proof,
+   then flips 24 random bytes inside the proof blob (via a small inline
+   Python step) to corrupt it structurally/cryptographically without
+   touching the surrounding Candid syntax. It then:
+   - calls `verify` with the **corrupted** proof and asserts the response
+     contains `Err = ` (not a trap/reject) -- confirming `catch_unwind`
+     plus `panic = "unwind"` are actually taking effect in the deployed
+     WASM, not just in source;
+   - immediately calls `verify` again with the **original, uncorrupted**
+     proof for the *same* challenge and asserts it still returns `Ok = `
+     -- confirming the caught panic left canister state untouched (the
+     challenge wasn't wrongly marked consumed, the nullifier wasn't
+     wrongly marked spent).
+7. **Prints a summary** with both challenge ids, the golden-path nullifier,
+   and a pointer to the replica's own logged
+   `verify: proof_bytes=<N>B instructions=<M>` lines for reading the real
+   on-chain instruction cost of each call.
+
+The script is idempotent-ish but assumes a `--clean` start each run (a
+fresh registry, so the prover's leaf-index-0 assumption holds); re-running
+it tears down and restarts the local replica each time. It requires the
+two hardening edits described in ["Known limitations"](#known-limitations--the-most-likely-bugs)
+to already be applied in your working tree (`panic = "unwind"` in the
+workspace `Cargo.toml`, and the three-phase `verify()` in
+`canister/src/lib.rs`) -- it builds/tests/deploys/exercises the result, it
+doesn't apply those edits itself.
+
 ## Known limitations / the most likely bugs
 
+- **`catch_unwind` hardening is now implemented and confirmed live**, but
+  the two pieces it depends on are both easy to lose in a future edit and
+  worth watching for regressions:
+  - `[profile.release]` in the workspace `Cargo.toml` must stay
+    `panic = "unwind"`. Under `panic = "abort"` (a common wasm
+    size-optimization default), `catch_unwind` silently becomes a no-op
+    and a malformed proof traps the call again -- exactly the failure
+    mode `run_full_cycle.sh` step 6 exists to catch.
+  - The `catch_unwind`-wrapped closure in `canister/src/lib.rs`'s `verify`
+    must keep touching no `RefCell`/canister state -- that's what makes
+    catching the panic safe (nothing is left half-mutated). If future
+    changes move state access inside that closure, the "legitimate retry
+    succeeds after a caught panic" guarantee (step 6's second half) needs
+    re-verifying.
 - **The linear "mix" layer (`MIX` constant / `mix()` function) is not a
   verified MDS matrix.** For a real deployment this needs to be replaced
   with a matrix that's actually been checked for the MDS property (or the
   whole permutation swapped for an established one) -- see point 1 in
   "Challenges."
-- **No `catch_unwind` hardening** around `winterfell::verify` in the
-  canister yet -- a structurally malformed proof can trap the whole
-  `update` call rather than returning `Err(..)`, same open item
-  `ic-winterfell-verifier`'s own network testing surfaced.
 - **Stable-memory upgrade persistence uses the legacy
   `ic_cdk::storage::stable_save`/`stable_restore` pair**, adequate for a
   prototype's state size but worth migrating to `ic-stable-structures` for
@@ -584,4 +704,21 @@ canister's real Merkle root away from what the prover's proof assumes, and
   forward.
 - **Challenge TTL is short (5 minutes) and easy to exceed during manual
   testing or debugging** -- see point 10 in "Challenges" for the failure
-  mode and the recommended atomic request-prove-verify pattern.
+  mode and the recommended atomic request-prove-verify pattern
+  (`run_full_cycle.sh` automates this).
+- **`request_challenge` is public and unauthenticated**, with no
+  caller-bound commitment -- a nullifier check protects against replaying
+  a *spent* proof, but not necessarily against a third party racing bogus
+  `verify` calls against a legitimate challenge before the real prover's
+  proof lands. Worth deciding whether `request_challenge` should require a
+  caller-bound commitment, or move to a challenge scoped to the requesting
+  principal.
+- **`dfx deploy`'s built-in `cargo audit` step can fail with `error:
+  error loading advisory database: parse error: duplicate advisory ID:
+  ...`** on some machines. This is a corrupted/stale local clone of the
+  RustSec advisory database (usually cached at `~/.cargo/advisory-db/`),
+  not a real vulnerability finding -- `cargo audit` aborts before scanning
+  any dependency, and dfx's generic "Audit found vulnerabilities" message
+  is misleading in this specific failure mode. `dfx deploy` treats this as
+  non-fatal and continues; to clear it, `rm -rf ~/.cargo/advisory-db &&
+  cargo install cargo-audit --force` and re-run.
