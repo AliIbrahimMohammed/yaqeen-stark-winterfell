@@ -1,10 +1,15 @@
 [package]
-name = "title_air"
+name = "air_test_harness"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-winterfell = { path = "../facade" }
+# The real, unmodified production crate -- not a copy, not a `#[path]`
+# trick. This harness now requires network access to crates.io and a
+# recent enough toolchain (edition2024 transitive deps) to build; see
+# ../README.md.
+title_air = { path = "../../air" }
+winterfell = { version = "0.13.1", default-features = false, features = ["std"] }
 
 [[bin]]
 name = "e2e_harness"

@@ -526,8 +526,12 @@ impl Air for TitleAir {
     }
 }
 
-#[cfg(test)]
 mod tests {
+    #[allow(unused_imports)] // harmless: unused when this file is compiled
+    // stand-alone (winterfell) vs. through the test-harness facade (which
+    // already re-exports everything via `pub use air_source::*` one level
+    // up) -- keeping the import documents the module's real dependency
+    // either way instead of leaving it to hidden crate-level re-exports.
     use super::*;
 
     #[test]
@@ -543,5 +547,234 @@ mod tests {
     fn trace_length_is_power_of_two() {
         assert!(TRACE_LENGTH.is_power_of_two());
         assert_eq!(TRACE_LENGTH, 256);
+    }
+
+    // -----------------------------------------------------------------
+    // hash()
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn hash_is_sensitive_to_input_order() {
+        // Domain separation / argument order matters: swapping two inputs
+        // must not collide, or the "leaf" and "nullifier" statements could
+        // be confused with each other off-chain.
+        let a = hash(&[BaseElement::new(1), BaseElement::new(2)]);
+        let b = hash(&[BaseElement::new(2), BaseElement::new(1)]);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn hash_zero_pads_and_can_collide_across_lengths() {
+        // `hash()` right-pads its input with zeros up to STATE_WIDTH, so
+        // `hash(&[1])` and `hash(&[1, 0])` are DEFINED to collide -- this
+        // is not a bug, it's the documented contract. This test pins that
+        // contract down explicitly so it can't silently change, and so the
+        // real safety boundary is visible in one place:
+        //
+        //   hash() is only safe to call with a FIXED arity per domain,
+        //   tagged by a domain constant as the first element (as every
+        //   call site in this codebase does -- see DOMAIN_NODE,
+        //   DOMAIN_OWNER_COMMITMENT, DOMAIN_LEAF usage in
+        //   prover/src/main.rs). It must never be called with untrusted,
+        //   variable-length input expecting length to be part of the
+        //   digest -- callers that need that must hash the length in
+        //   explicitly (e.g. as an extra fixed-position field element).
+        let a = hash(&[BaseElement::new(1)]);
+        let b = hash(&[BaseElement::new(1), BaseElement::new(0)]);
+        assert_eq!(a, b, "hash() zero-pads; this collision is expected");
+
+        // But a genuinely different (non-zero-padding-equivalent) input
+        // must still differ.
+        let c = hash(&[BaseElement::new(1), BaseElement::new(2)]);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn hash_empty_input_is_deterministic_and_nonzero() {
+        let a = hash(&[]);
+        let b = hash(&[]);
+        assert_eq!(a, b);
+        // Sanity: an all-zero state run through real round constants
+        // shouldn't land back on zero.
+        assert_ne!(a, BaseElement::ZERO);
+    }
+
+    #[test]
+    fn hash_accepts_full_width_input() {
+        // STATE_WIDTH inputs is the documented max; must not panic.
+        let inputs = [BaseElement::new(7); STATE_WIDTH];
+        let _ = hash(&inputs);
+    }
+
+    #[test]
+    #[should_panic(expected = "hash() supports at most")]
+    fn hash_rejects_too_many_inputs() {
+        let inputs = [BaseElement::new(1); STATE_WIDTH + 1];
+        let _ = hash(&inputs);
+    }
+
+    // -----------------------------------------------------------------
+    // round_constants() / apply_round()
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn round_constants_are_deterministic() {
+        let a = round_constants();
+        let b = round_constants();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn round_constants_are_not_trivially_zero() {
+        // Every round should contribute real mixing; a bug in the splitmix
+        // expansion (e.g. reseeding to 0) would silently degrade this.
+        for round in round_constants().iter() {
+            assert!(round.iter().any(|&c| c != BaseElement::ZERO));
+        }
+    }
+
+    #[test]
+    fn apply_round_is_deterministic() {
+        let state = [BaseElement::new(1); STATE_WIDTH];
+        let rc = round_constants()[0];
+        let a = apply_round(&state, &rc);
+        let b = apply_round(&state, &rc);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn apply_round_changes_state() {
+        // A permutation round that leaves the state untouched would make
+        // every job's digest independent of its inputs.
+        let state = [BaseElement::new(1); STATE_WIDTH];
+        let rc = round_constants()[0];
+        let next = apply_round(&state, &rc);
+        assert_ne!(state, next);
+    }
+
+    #[test]
+    fn apply_round_is_sensitive_to_round_constants() {
+        // Using round 0's constants vs round 1's constants on the same
+        // input must diverge, or the permutation would effectively use
+        // only a single round constant.
+        let state = [BaseElement::new(5); STATE_WIDTH];
+        let rcs = round_constants();
+        let a = apply_round(&state, &rcs[0]);
+        let b = apply_round(&state, &rcs[1]);
+        assert_ne!(a, b);
+    }
+
+    // -----------------------------------------------------------------
+    // Trace-layout invariants
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn job_and_row_layout_matches_docs() {
+        assert_eq!(JOB_OWNER, 0);
+        assert_eq!(JOB_LEAF, 1);
+        assert_eq!(JOB_MERKLE_FIRST, 2);
+        assert_eq!(JOB_MERKLE_LAST, 26);
+        assert_eq!(JOB_NULLIFIER, 27);
+        assert_eq!(REAL_JOB_COUNT, 28);
+        assert_eq!(JOB_COUNT, 32);
+
+        assert_eq!(job_start_row(JOB_LEAF), 8);
+        assert_eq!(ROW_LEAF_FIRST, 8);
+        assert_eq!(job_last_row(JOB_MERKLE_LAST), 215);
+        assert_eq!(ROW_MERKLE_LAST_OUTPUT, 215);
+        assert_eq!(job_start_row(JOB_NULLIFIER), 216);
+        assert_eq!(ROW_NULLIFIER_FIRST, 216);
+        assert_eq!(job_last_row(JOB_NULLIFIER), 223);
+        assert_eq!(ROW_NULLIFIER_OUTPUT, 223);
+
+        // Every job occupies exactly ROUNDS rows, and jobs tile the trace
+        // with no gaps or overlaps.
+        assert_eq!(job_last_row(JOB_COUNT - 1), TRACE_LENGTH - 1);
+        for job in 0..JOB_COUNT {
+            assert_eq!(job_last_row(job) - job_start_row(job) + 1, ROUNDS);
+            if job > 0 {
+                assert_eq!(job_start_row(job), job_last_row(job - 1) + 1);
+            }
+        }
+    }
+
+    #[test]
+    fn job_type_column_covers_every_job_exactly_once_per_type() {
+        assert_eq!(job_type_column(JOB_OWNER), T_OWNER);
+        assert_eq!(job_type_column(JOB_LEAF), T_LEAF);
+        assert_eq!(job_type_column(JOB_NULLIFIER), T_NULLIFIER);
+        for job in JOB_MERKLE_FIRST..=JOB_MERKLE_LAST {
+            assert_eq!(job_type_column(job), T_MERKLE);
+        }
+        // Padding jobs (28..=31) are arbitrarily typed as merkle steps,
+        // per the doc comment -- pin that down so a future change to the
+        // padding convention is a deliberate, visible edit.
+        for job in (JOB_NULLIFIER + 1)..JOB_COUNT {
+            assert_eq!(job_type_column(job), T_MERKLE);
+        }
+    }
+
+    #[test]
+    fn column_indices_are_within_bounds_and_non_overlapping() {
+        // s0..s7, aux_a..d, held_secret/pid, t_owner..t_nullifier, then
+        // rc_bit_0..31 must exactly tile TRACE_WIDTH with no gaps.
+        let mut seen = vec![false; TRACE_WIDTH];
+        let mut mark = |col: usize| {
+            assert!(col < TRACE_WIDTH, "column {col} out of bounds");
+            assert!(!seen[col], "column {col} used twice");
+            seen[col] = true;
+        };
+        for c in 0..STATE_WIDTH {
+            mark(c); // s0..s7
+        }
+        mark(AUX_A);
+        mark(AUX_B);
+        mark(AUX_C);
+        mark(AUX_D);
+        mark(HELD_SECRET);
+        mark(HELD_PID);
+        mark(T_OWNER);
+        mark(T_LEAF);
+        mark(T_MERKLE);
+        mark(T_NULLIFIER);
+        for i in 0..RANGE_BITS {
+            mark(RC_BIT_0 + i);
+        }
+        assert!(seen.iter().all(|&b| b), "not every column is accounted for");
+    }
+
+    #[test]
+    fn num_transition_constraints_matches_formula() {
+        // 8 state lanes + held_secret + held_pid + 4 type-column booleans
+        // + 1 one-hot-sum + 1 merkle-bit-boolean + 32 range bits + 1
+        // range weighted-sum, per the doc comment above the constant.
+        assert_eq!(
+            NUM_TRANSITION_CONSTRAINTS,
+            STATE_WIDTH + 2 + 4 + 1 + 1 + RANGE_BITS + 1
+        );
+        assert_eq!(NUM_TRANSITION_CONSTRAINTS, 49);
+    }
+
+    #[test]
+    fn public_inputs_to_elements_preserves_order() {
+        let pi = PublicInputs {
+            registry_id: BaseElement::new(1),
+            merkle_root: BaseElement::new(2),
+            purpose: BaseElement::new(3),
+            request_nonce: BaseElement::new(4),
+            current_timestamp: BaseElement::new(5),
+            nullifier: BaseElement::new(6),
+        };
+        assert_eq!(
+            pi.to_elements(),
+            vec![
+                BaseElement::new(1),
+                BaseElement::new(2),
+                BaseElement::new(3),
+                BaseElement::new(4),
+                BaseElement::new(5),
+                BaseElement::new(6),
+            ]
+        );
     }
 }

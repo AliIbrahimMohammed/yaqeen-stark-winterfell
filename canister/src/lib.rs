@@ -1456,6 +1456,103 @@ mod tests {
     }
 
     #[test]
+    fn verify_crypto_accepts_a_genuine_proof_from_the_real_prover() {
+        // Every other verify_crypto_impl test above only ever feeds it
+        // garbage/malformed proof_bytes -- which proves the panic-safety
+        // boundary holds, but never actually proves the *happy path*
+        // works: that a real, honestly-generated STARK proof from the
+        // real off-chain prover is accepted. Previously that gap was only
+        // closed by `run_full_cycle.sh` against a live dfx replica. Now
+        // that `title_prover`'s trace-building/proving logic lives in a
+        // reusable library (`prover/src/lib.rs`), this test closes it
+        // directly, offline, as part of `cargo test -p title_verifier`.
+        use title_prover::{
+            build_trace, BatchingMethod, FieldExtension, MerkleTree, ProofOptions, SparseTree,
+            TitleProver, WinterFieldElement, WinterProver, Witness,
+        };
+        use title_air::{DOMAIN_LEAF as PROVER_DOMAIN_LEAF, DOMAIN_OWNER_COMMITMENT, DOMAIN_NODE as PROVER_DOMAIN_NODE, hash};
+
+        // ---- Build a demo record + tree, exactly like `title_prover`'s
+        // ---- own CLI `main()` does, but with values matching this
+        // ---- test's REGISTRY_ID / purpose / nonce / timestamp.
+        let registry_id = fe(REGISTRY_ID);
+        let owner_secret = fe(0xA11CE);
+        let property_id = fe(42);
+        let owner_commitment = hash(&[fe(DOMAIN_OWNER_COMMITMENT), owner_secret, property_id]);
+        let current_timestamp: u64 = 1_754_000_000;
+        let license_expiry: u64 = current_timestamp + 365 * 24 * 3600;
+        let leaf = hash(&[
+            fe(PROVER_DOMAIN_LEAF),
+            registry_id,
+            owner_commitment,
+            BaseElement::ZERO, // encumbrance_flag
+            WinterFieldElement::ONE,
+            fe(license_expiry),
+        ]);
+        let _ = PROVER_DOMAIN_NODE; // referenced only via SparseTree internally
+
+        let mut tree = SparseTree::new();
+        tree.insert_leaf(0, leaf);
+        let (siblings, bits) = tree.proof(0);
+        let merkle_root = tree.root();
+
+        let purpose = WinterFieldElement::ONE;
+        let request_nonce = fe(7);
+
+        let witness = Witness {
+            registry_id,
+            purpose,
+            request_nonce,
+            current_timestamp,
+            owner_secret,
+            property_id,
+            license_expiry,
+            merkle_siblings: siblings,
+            merkle_bits: bits,
+        };
+
+        let (trace, pub_inputs) = build_trace(&witness);
+        assert_eq!(pub_inputs.merkle_root, merkle_root, "sanity: trace's root must match the tree");
+
+        let options = ProofOptions::new(
+            32, 8, 0, FieldExtension::None, 8, 31,
+            BatchingMethod::Linear, BatchingMethod::Linear,
+        );
+        let prover = TitleProver::new(options, pub_inputs.clone());
+        let proof = WinterProver::prove(&prover, trace).expect("proof generation must succeed");
+        let proof_bytes = proof.to_bytes();
+
+        // Sanity: the real off-chain verifier (same one `title_prover`'s
+        // own CLI self-checks with) must accept this proof too, before we
+        // even get to the canister's own verify_crypto_impl.
+        let min_opts = winterfell::AcceptableOptions::MinConjecturedSecurity(80);
+        winterfell::verify::<TitleAir, title_air::HashFn, title_air::RandCoin, MerkleTree<title_air::HashFn>>(
+            proof.clone(),
+            pub_inputs.clone(),
+            &min_opts,
+        )
+        .expect("off-chain verify must accept the proof it just generated");
+
+        // ---- Now feed the exact same proof bytes + matching public
+        // ---- inputs through the canister's own verify_crypto_impl, the
+        // ---- real function `verify`'s update-call handler delegates to.
+        let public_inputs = VerifyPublicInputs {
+            registry_id: REGISTRY_ID,
+            merkle_root: fe_to_string(pub_inputs.merkle_root),
+            purpose: 1,
+            request_nonce: 7,
+            current_timestamp,
+            nullifier: fe_to_string(pub_inputs.nullifier),
+        };
+
+        let result = verify_crypto_impl(&public_inputs, &proof_bytes);
+        assert!(
+            result.is_ok(),
+            "canister must accept a genuine proof from the real prover, got: {result:?}"
+        );
+    }
+
+    #[test]
     fn verify_crypto_rejects_malformed_merkle_root_before_touching_proof_bytes() {
         // Confirms the crypto phase's own decimal-string parsing (for
         // merkle_root/nullifier) also fails cleanly rather than panicking,

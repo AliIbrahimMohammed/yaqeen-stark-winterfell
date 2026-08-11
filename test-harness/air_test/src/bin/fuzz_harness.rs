@@ -1,60 +1,35 @@
-use title_air::*;
-use winterfell::{Air, EvaluationFrame, ProofOptions, TraceInfo};
+//! Human-readable demo runner for `air_test::fuzz_support`, which is what
+//! actually implements the fuzzing logic and has its own `#[test]`s (with
+//! a smaller iteration count) that run under plain `cargo test`. This
+//! binary runs a longer pass for manual or CI use.
 
-// xorshift PRNG, no external crate needed (network-restricted sandbox)
-struct Rng(u64);
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-    fn field_elem(&mut self) -> BaseElement {
-        BaseElement::new(self.next() as u128)
-    }
-}
+use air_test_harness::fuzz_support::*;
+use air_test_harness::TRACE_LENGTH;
 
 fn main() {
-    let dummy_pub = PublicInputs {
-        registry_id: BaseElement::ZERO,
-        merkle_root: BaseElement::ZERO,
-        purpose: BaseElement::ZERO,
-        request_nonce: BaseElement::ZERO,
-        current_timestamp: BaseElement::ZERO,
-        nullifier: BaseElement::ZERO,
-    };
-    let trace_info = TraceInfo::new(TRACE_WIDTH, TRACE_LENGTH);
-    let air = TitleAir::new(trace_info, dummy_pub, ProofOptions);
-    let periodic = air.get_periodic_column_values();
-
-    let mut rng = Rng(0xF00DBABE_u64);
-    let mut panics = 0;
-    let mut oob = 0;
     let total_steps = TRACE_LENGTH;
 
-    for step in 0..total_steps {
-        let cur: Vec<BaseElement> = (0..TRACE_WIDTH).map(|_| rng.field_elem()).collect();
-        let nxt: Vec<BaseElement> = (0..TRACE_WIDTH).map(|_| rng.field_elem()).collect();
-        let frame = EvaluationFrame::from_rows(cur, nxt);
-        let cycle_pos = step % ROUNDS;
-        let pv: Vec<BaseElement> = periodic.iter().map(|col| col[cycle_pos % col.len()]).collect();
-        let mut result = vec![BaseElement::ZERO; NUM_TRANSITION_CONSTRAINTS];
-        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            air.evaluate_transition::<BaseElement>(&frame, &pv, &mut result);
-        }));
-        if r.is_err() {
-            panics += 1;
-        }
-    }
-
-    println!("=== Fuzz: {} row-transitions with arbitrary (non-satisfying) data ===", total_steps);
-    println!("panics/out-of-bounds: {panics}  (oob tracked separately: {oob})");
+    let panics = fuzz_no_panics(0xF00DBABE, total_steps);
+    println!("=== Fuzz 1: {total_steps} row-transitions with arbitrary (non-satisfying) data ===");
+    println!("panics: {panics}");
     if panics == 0 {
         println!("[ok] no panics or out-of-bounds indexing across {total_steps} arbitrary row-transitions");
     } else {
         println!("[FAIL] {panics} panics found");
         std::process::exit(1);
     }
-    let _ = oob;
+
+    // Soundness pass, not just robustness: for random non-boolean values
+    // written into a boolean-constrained column, checks that the AIR's
+    // own constraint actually flags the violation.
+    let bool_iterations = 2000;
+    let missed = fuzz_boolean_violations_are_caught(0xC0FFEE, bool_iterations);
+    println!("\n=== Fuzz 2: {bool_iterations} random non-boolean AUX_B values ===");
+    println!("violations missed by the merkle-bit constraint: {missed}");
+    if missed == 0 {
+        println!("[ok] every non-boolean value was caught by the merkle-bit constraint");
+    } else {
+        println!("[FAIL] {missed} non-boolean values were NOT flagged -- constraint may be broken or missing");
+        std::process::exit(1);
+    }
 }

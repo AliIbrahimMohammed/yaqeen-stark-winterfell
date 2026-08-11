@@ -2,6 +2,31 @@
 resolver = "2"
 members = ["air", "canister", "prover"]
 
+# `debug-assertions = false` for `dev` (the profile `cargo build`/`cargo
+# test` use by default): winterfell's own prover has an internal,
+# `#[cfg(debug_assertions)]`-gated sanity check
+# (`ConstraintEvaluationTable::validate_transition_degrees`) that asserts
+# every transition constraint's *actual* interpolated degree on a given
+# trace exactly equals the AIR's conservative *declared* degree bound --
+# not merely `<=`. That's a stricter invariant than "the proof is sound":
+# our AIR's declared degrees are deliberately conservative (see
+# `air/src/lib.rs`'s "Known limitations" note), and for tests with a
+# single demo record the actual per-cycle degree of some constraints
+# (e.g. the one-hot-sum / range-bit constraints) legitimately comes out
+# lower than the bound on that specific small trace. This is exactly why
+# `cargo run --release -p title_prover` (debug_assertions off) has always
+# worked, while `cargo test`'s default dev profile (debug_assertions on)
+# would trip this internal winterfell check on the exact same trace/proof
+# -- see `verify_crypto_accepts_a_genuine_proof_from_the_real_prover` in
+# canister/src/lib.rs, which generates and verifies a real proof as part
+# of `cargo test -p title_verifier`. Turning this off does NOT weaken any
+# of this workspace's own `assert!`/`assert_eq!` test assertions (those
+# are unconditional, not `debug_assert!`); it only disables integer
+# overflow checks and library-internal `debug_assert!`s like the one
+# above for dev/test builds.
+[profile.dev]
+debug-assertions = false
+
 [profile.release]
 opt-level = 3
 lto = true

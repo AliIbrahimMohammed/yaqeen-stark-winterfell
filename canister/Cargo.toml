@@ -21,3 +21,13 @@ title_air = { path = "../air" }
 # ic-winterfell-verifier: rayon spawns OS threads, unavailable in a
 # canister's single-threaded WASM sandbox.
 winterfell = { version = "0.13.1", default-features = true }
+
+[dev-dependencies]
+# Only used by `#[cfg(test)]` to generate a genuine STARK proof so
+# `verify_crypto_impl` can be tested against real proof bytes, not just
+# garbage/malformed ones -- see the
+# `verify_crypto_accepts_a_genuine_proof_from_the_real_prover` test below.
+# `title_prover`'s "concurrent" (rayon) feature is fine here: dev-deps only
+# ever build for `cargo test`'s native target, never for the wasm32
+# canister build.
+title_prover = { path = "../prover" }
