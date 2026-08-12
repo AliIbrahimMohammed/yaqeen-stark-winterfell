@@ -35,7 +35,7 @@
 use candid::{CandidType, Principal};
 use serde::Deserialize;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use title_air::{BaseElement, PublicInputs, TitleAir, DOMAIN_LEAF, DOMAIN_NODE, TREE_DEPTH};
 use winterfell::{math::FieldElement, AcceptableOptions, Proof};
@@ -55,6 +55,30 @@ fn parse_fe(s: &str) -> Result<BaseElement, String> {
 fn fe_to_string(v: BaseElement) -> String {
     // BaseElement's Display already renders the canonical decimal value.
     format!("{v}")
+}
+
+/// Parses a decimal-string field element and re-renders it through
+/// `fe_to_string`, producing the one canonical string for whatever value
+/// it represents.
+///
+/// SECURITY: every OTHER server-authoritative field element in `verify`
+/// (`merkle_root`, `registry_id`, ...) is compared as a *parsed*
+/// `BaseElement`, so "007" and "7" are already indistinguishable there.
+/// The nullifier spent-check was the one exception -- `s.nullifiers` is
+/// keyed by the raw, un-normalized string straight off the wire, while
+/// `verify_crypto_impl` (correctly) parses it into a `BaseElement` before
+/// checking it against the proof. `BaseElement::new` performs at most one
+/// modular subtraction (`if value < M { value } else { value - M }`), so
+/// any value in `[M, 2^128)` -- a real, reachable u128 range, not merely a
+/// theoretical one -- silently aliases a canonical value below `M`; on
+/// top of that, plain leading-zero padding ("007" vs "7") already aliases
+/// trivially through ordinary integer parsing, with no modular arithmetic
+/// needed at all. Routing every nullifier read/write through this
+/// function before it ever touches `s.nullifiers` closes that gap and
+/// brings nullifiers in line with how every other field element here is
+/// already handled.
+fn canonical_nullifier(s: &str) -> Result<String, String> {
+    parse_fe(s).map(fe_to_string)
 }
 
 // ---------------------------------------------------------------------
@@ -143,6 +167,22 @@ const CHALLENGE_TTL_NS: i64 = 5 * 60 * 1_000_000_000;
 const MIN_CALL_INTERVAL_NS: i64 = 2_000_000_000;
 const MAX_PRUNE_PER_HEARTBEAT: u64 = 50;
 const REGISTRY_ID: u64 = 1;
+// SECURITY: `last_challenge_call_at`/`last_verify_call_at` are keyed by
+// `Principal`, and minting a fresh IC principal is free (any new Ed25519
+// keypair, or any anonymous webauthn credential, works). Before this fix
+// neither map was ever pruned, so a caller spamming `request_challenge` or
+// `verify` (even with calls designed to fail after the throttle check --
+// `check_and_update_throttle` records the timestamp unconditionally,
+// before the rest of the call runs) from a fresh principal each time grew
+// canister stable memory by one entry per call, forever, with no bound --
+// an unbounded state-bloat DoS, unlike `challenges` (already pruned,
+// bounded per heartbeat tick above) or `nullifiers` (bounded by genuine
+// distinct proof submissions, which cost real proving work to produce).
+// A one-hour retention window is comfortably longer than
+// `MIN_CALL_INTERVAL_NS` (2s) ever needs for correct throttling, so this
+// never affects legitimate rate-limiting behavior -- it only bounds how
+// long a *single* stale entry survives.
+const THROTTLE_RETENTION_NS: i64 = 60 * 60 * 1_000_000_000;
 
 #[derive(Default)]
 struct State {
@@ -165,6 +205,11 @@ struct State {
 
     last_challenge_call_at: HashMap<Principal, i64>,
     last_verify_call_at: HashMap<Principal, i64>,
+    // Insertion-ordered log backing bounded, per-heartbeat-tick pruning of
+    // the two maps above -- see `prune_throttle_log` and
+    // `THROTTLE_RETENTION_NS`.
+    challenge_throttle_log: VecDeque<(Principal, i64)>,
+    verify_throttle_log: VecDeque<(Principal, i64)>,
 }
 
 thread_local! {
@@ -214,9 +259,25 @@ fn init() {
 
 /// One-time bootstrap: succeeds only while there are no admins yet. See
 /// `main.mo`'s `bootstrapAdmin` for the full rationale (no constructor
-/// arguments available; this is the runtime equivalent). Call this in the
-/// SAME deploy session, before the canister id is shared.
-fn bootstrap_admin_impl(s: &mut State, real_admin: Principal) -> Result<(), String> {
+/// arguments available; this is the runtime equivalent).
+///
+/// SECURITY: `request_challenge`/`verify` prove this canister's calls are
+/// otherwise reached over the public IC network, and `bootstrap_admin`
+/// used to be gated on nothing but "no admins exist yet" -- i.e. it was a
+/// fully public, unauthenticated call. The stated mitigation ("call it in
+/// the same deploy session, before the canister id is shared") is weak in
+/// practice: canister ids on a subnet are sequential/guessable, and a bot
+/// simply polling `health`/`bootstrap_admin` against freshly-created
+/// canister ids could win the race against a human deployer without ever
+/// having seen the id shared anywhere. Restricting this to controllers
+/// closes that race entirely: only principals the deployer explicitly
+/// added as controllers (via `dfx canister create`/`dfx identity`) can
+/// ever bootstrap the first admin, so there is no longer a public race to
+/// win regardless of timing.
+fn bootstrap_admin_impl(s: &mut State, caller_is_controller: bool, real_admin: Principal) -> Result<(), String> {
+    if !caller_is_controller {
+        return Err("only a canister controller may bootstrap the admin list".to_string());
+    }
     if !s.admins.is_empty() {
         return Err("admins already bootstrapped -- use add_admin instead".to_string());
     }
@@ -226,7 +287,9 @@ fn bootstrap_admin_impl(s: &mut State, real_admin: Principal) -> Result<(), Stri
 
 #[ic_cdk::update]
 fn bootstrap_admin(real_admin: Principal) -> Result<(), String> {
-    STATE.with(|s| bootstrap_admin_impl(&mut s.borrow_mut(), real_admin))
+    let caller = ic_cdk::api::msg_caller();
+    let caller_is_controller = ic_cdk::api::is_controller(&caller);
+    STATE.with(|s| bootstrap_admin_impl(&mut s.borrow_mut(), caller_is_controller, real_admin))
 }
 
 fn add_admin_impl(s: &mut State, caller: Principal, new_admin: Principal) -> Result<(), String> {
@@ -404,6 +467,7 @@ fn get_merkle_proof(property_id: u64) -> Option<MerkleProof> {
 
 fn check_and_update_throttle(
     store: &mut HashMap<Principal, i64>,
+    log: &mut VecDeque<(Principal, i64)>,
     caller: Principal,
     now_ns: i64,
 ) -> Result<(), String> {
@@ -416,7 +480,38 @@ fn check_and_update_throttle(
         }
     }
     store.insert(caller, now_ns);
+    log.push_back((caller, now_ns));
     Ok(())
+}
+
+/// Bounded, per-tick prune of a throttle map/log pair -- same
+/// per-tick-bound discipline as challenge pruning below, applied to
+/// `last_challenge_call_at`/`last_verify_call_at` (see
+/// `THROTTLE_RETENTION_NS`). `log` is insertion-ordered by `now_ns` (IC
+/// time is non-decreasing across calls), so the moment its front entry is
+/// too recent to prune, every entry behind it is too, and we can stop.
+fn prune_throttle_log(
+    store: &mut HashMap<Principal, i64>,
+    log: &mut VecDeque<(Principal, i64)>,
+    now_ns: i64,
+    max_per_tick: u64,
+) {
+    let mut pruned = 0u64;
+    while pruned < max_per_tick {
+        let Some(&(p, ts)) = log.front() else { break };
+        if now_ns - ts < THROTTLE_RETENTION_NS {
+            break;
+        }
+        log.pop_front();
+        // Only drop the map entry if it's still exactly this stale
+        // timestamp -- a later call from the same principal would have
+        // refreshed `store` (and pushed its own, newer log entry), and we
+        // must not clobber that newer throttle state.
+        if store.get(&p) == Some(&ts) {
+            store.remove(&p);
+        }
+        pruned += 1;
+    }
 }
 
 fn request_challenge_impl(
@@ -425,7 +520,7 @@ fn request_challenge_impl(
     now_ns: i64,
     purpose: u64,
 ) -> Result<ChallengeView, String> {
-    check_and_update_throttle(&mut s.last_challenge_call_at, caller, now_ns)?;
+    check_and_update_throttle(&mut s.last_challenge_call_at, &mut s.challenge_throttle_log, caller, now_ns)?;
 
     let id = s.next_challenge_id;
     s.next_challenge_id += 1;
@@ -479,7 +574,7 @@ fn verify_precheck_impl(
     challenge_id: u64,
     public_inputs: &VerifyPublicInputs,
 ) -> Result<(), String> {
-    check_and_update_throttle(&mut s.last_verify_call_at, caller, now_ns)?;
+    check_and_update_throttle(&mut s.last_verify_call_at, &mut s.verify_throttle_log, caller, now_ns)?;
 
     let challenge = s
         .challenges
@@ -520,7 +615,8 @@ fn verify_precheck_impl(
     if public_inputs.current_timestamp != challenge.current_timestamp {
         return Err("current_timestamp mismatch".to_string());
     }
-    if s.nullifiers.get(&public_inputs.nullifier).copied().unwrap_or(false) {
+    let nullifier_key = canonical_nullifier(&public_inputs.nullifier)?;
+    if s.nullifiers.get(&nullifier_key).copied().unwrap_or(false) {
         return Err("nullifier already spent".to_string());
     }
     Ok(())
@@ -568,6 +664,12 @@ fn verify_crypto_impl(public_inputs: &VerifyPublicInputs, proof_bytes: &[u8]) ->
 }
 
 /// Phase 3: commit -- only reached if verification actually succeeded.
+/// `nullifier` must already be the canonical string (see
+/// `canonical_nullifier`) -- callers are expected to canonicalize once in
+/// `verify_precheck_impl` and thread that same value through, rather than
+/// each phase re-deriving it (and risking one phase using the raw wire
+/// string while another uses the canonical form, which is exactly the
+/// inconsistency this fixes).
 fn verify_commit_impl(s: &mut State, challenge_id: u64, nullifier: &str) -> Result<VerifyOk, String> {
     // Defense in depth: re-check the nullifier here too. Unreachable in
     // today's single-threaded, non-`await`ing execution model, but cheap
@@ -599,7 +701,13 @@ fn verify(challenge_id: u64, proof_bytes: Vec<u8>, public_inputs: VerifyPublicIn
     let precheck = STATE.with(|s| verify_precheck_impl(&mut s.borrow_mut(), caller, now_ns, challenge_id, &public_inputs));
     let crypto_result = precheck.and_then(|()| verify_crypto_impl(&public_inputs, &proof_bytes));
     let result = crypto_result.and_then(|()| {
-        STATE.with(|s| verify_commit_impl(&mut s.borrow_mut(), challenge_id, &public_inputs.nullifier))
+        // Canonicalize once here rather than re-deriving inside
+        // verify_commit_impl, so precheck's spent-check and commit's
+        // insert are guaranteed to key off the exact same string -- see
+        // `canonical_nullifier`'s doc comment for why this matters.
+        canonical_nullifier(&public_inputs.nullifier).and_then(|nullifier_key| {
+            STATE.with(|s| verify_commit_impl(&mut s.borrow_mut(), challenge_id, &nullifier_key))
+        })
     });
 
     let used = ic_cdk::api::instruction_counter().saturating_sub(start_instructions);
@@ -614,7 +722,10 @@ fn verify(challenge_id: u64, proof_bytes: Vec<u8>, public_inputs: VerifyPublicIn
 
 fn heartbeat_impl(s: &mut State, now_ns: i64) {
     let mut scanned = 0u64;
-    while scanned < MAX_PRUNE_PER_HEARTBEAT && s.oldest_unpruned_challenge_id < s.next_challenge_id {
+    loop {
+        if scanned >= MAX_PRUNE_PER_HEARTBEAT || s.oldest_unpruned_challenge_id >= s.next_challenge_id {
+            break;
+        }
         let id = s.oldest_unpruned_challenge_id;
         match s.challenges.get(&id) {
             None => {
@@ -625,12 +736,18 @@ fn heartbeat_impl(s: &mut State, now_ns: i64) {
                     s.challenges.remove(&id);
                     s.oldest_unpruned_challenge_id += 1;
                 } else {
-                    return;
+                    break;
                 }
             }
         }
         scanned += 1;
     }
+
+    // Independent of challenge pruning above (and never skipped by its
+    // early `break`): bound the two throttle logs' growth the same way.
+    // See `THROTTLE_RETENTION_NS`/`prune_throttle_log`.
+    prune_throttle_log(&mut s.last_challenge_call_at, &mut s.challenge_throttle_log, now_ns, MAX_PRUNE_PER_HEARTBEAT);
+    prune_throttle_log(&mut s.last_verify_call_at, &mut s.verify_throttle_log, now_ns, MAX_PRUNE_PER_HEARTBEAT);
 }
 
 #[ic_cdk::heartbeat]
@@ -802,6 +919,19 @@ fn post_upgrade() {
         s.nullifiers = snapshot.nullifiers.into_iter().collect();
         s.last_challenge_call_at = snapshot.last_challenge_call_at.into_iter().collect();
         s.last_verify_call_at = snapshot.last_verify_call_at.into_iter().collect();
+        // The throttle logs backing bounded pruning (see
+        // `prune_throttle_log`) aren't part of `StableState` -- rebuild
+        // them from the restored maps instead of persisting a second
+        // near-duplicate copy of the same data. `HashMap` iteration order
+        // isn't the original insertion order, so immediately after an
+        // upgrade the log's early-exit optimization in
+        // `prune_throttle_log` is less precise (it may stop a tick's
+        // pruning slightly earlier than optimal until natural call
+        // traffic re-sorts it) -- never incorrect, since eviction is
+        // still gated on matching the stored timestamp exactly, just
+        // occasionally less prompt for one heartbeat's worth of work.
+        s.challenge_throttle_log = s.last_challenge_call_at.iter().map(|(&p, &ts)| (p, ts)).collect();
+        s.verify_throttle_log = s.last_verify_call_at.iter().map(|(&p, &ts)| (p, ts)).collect();
     });
 }
 
@@ -871,7 +1001,7 @@ mod tests {
     #[test]
     fn bootstrap_admin_succeeds_when_no_admins() {
         let mut s = fresh_state();
-        assert!(bootstrap_admin_impl(&mut s, p(1)).is_ok());
+        assert!(bootstrap_admin_impl(&mut s, true, p(1)).is_ok());
         assert!(is_admin(&s, &p(1)));
     }
 
@@ -880,18 +1010,36 @@ mod tests {
         // ATTACK: a second party racing to call bootstrap_admin before the
         // legitimate deployer must not be able to seize admin.
         let mut s = fresh_state();
-        bootstrap_admin_impl(&mut s, p(1)).unwrap();
-        let err = bootstrap_admin_impl(&mut s, p(2)).unwrap_err();
+        bootstrap_admin_impl(&mut s, true, p(1)).unwrap();
+        let err = bootstrap_admin_impl(&mut s, true, p(2)).unwrap_err();
         assert!(err.contains("already bootstrapped"));
         assert!(is_admin(&s, &p(1)));
         assert!(!is_admin(&s, &p(2)));
     }
 
     #[test]
+    fn bootstrap_admin_rejects_non_controller_even_as_first_caller() {
+        // ATTACK: a non-controller racing to be the very FIRST caller to
+        // bootstrap_admin (the dangerous race the "already bootstrapped"
+        // test above does NOT cover) must still be rejected -- admin
+        // bootstrap is controller-only, not just "first come first
+        // served" among the whole public network.
+        let mut s = fresh_state();
+        let err = bootstrap_admin_impl(&mut s, false, p(1)).unwrap_err();
+        assert!(err.contains("controller"));
+        assert!(s.admins.is_empty());
+        assert!(!is_admin(&s, &p(1)));
+
+        // A real controller can still bootstrap afterward.
+        assert!(bootstrap_admin_impl(&mut s, true, p(1)).is_ok());
+        assert!(is_admin(&s, &p(1)));
+    }
+
+    #[test]
     fn add_admin_unauthorized_rejected() {
         // ATTACK: a non-admin trying to grant itself admin rights.
         let mut s = fresh_state();
-        bootstrap_admin_impl(&mut s, p(1)).unwrap();
+        bootstrap_admin_impl(&mut s, true, p(1)).unwrap();
         let err = add_admin_impl(&mut s, p(99), p(99)).unwrap_err();
         assert_eq!(err, "unauthorized");
         assert!(!is_admin(&s, &p(99)));
@@ -900,7 +1048,7 @@ mod tests {
     #[test]
     fn add_admin_by_admin_succeeds() {
         let mut s = fresh_state();
-        bootstrap_admin_impl(&mut s, p(1)).unwrap();
+        bootstrap_admin_impl(&mut s, true, p(1)).unwrap();
         assert!(add_admin_impl(&mut s, p(1), p(2)).is_ok());
         assert!(is_admin(&s, &p(2)));
     }
@@ -908,7 +1056,7 @@ mod tests {
     #[test]
     fn add_admin_duplicate_is_idempotent_noop() {
         let mut s = fresh_state();
-        bootstrap_admin_impl(&mut s, p(1)).unwrap();
+        bootstrap_admin_impl(&mut s, true, p(1)).unwrap();
         add_admin_impl(&mut s, p(1), p(2)).unwrap();
         add_admin_impl(&mut s, p(1), p(2)).unwrap();
         assert_eq!(s.admins.iter().filter(|a| **a == p(2)).count(), 1);
@@ -917,7 +1065,7 @@ mod tests {
     #[test]
     fn remove_admin_unauthorized_rejected() {
         let mut s = fresh_state();
-        bootstrap_admin_impl(&mut s, p(1)).unwrap();
+        bootstrap_admin_impl(&mut s, true, p(1)).unwrap();
         add_admin_impl(&mut s, p(1), p(2)).unwrap();
         let err = remove_admin_impl(&mut s, p(99), p(2)).unwrap_err();
         assert_eq!(err, "unauthorized");
@@ -929,7 +1077,7 @@ mod tests {
         // ATTACK/DoS: removing the last admin would brick the registry
         // (no one left who can submit records or manage admins).
         let mut s = fresh_state();
-        bootstrap_admin_impl(&mut s, p(1)).unwrap();
+        bootstrap_admin_impl(&mut s, true, p(1)).unwrap();
         let err = remove_admin_impl(&mut s, p(1), p(1)).unwrap_err();
         assert!(err.contains("last remaining admin"));
         assert!(is_admin(&s, &p(1)));
@@ -938,7 +1086,7 @@ mod tests {
     #[test]
     fn remove_admin_succeeds_with_multiple_admins() {
         let mut s = fresh_state();
-        bootstrap_admin_impl(&mut s, p(1)).unwrap();
+        bootstrap_admin_impl(&mut s, true, p(1)).unwrap();
         add_admin_impl(&mut s, p(1), p(2)).unwrap();
         assert!(remove_admin_impl(&mut s, p(1), p(2)).is_ok());
         assert!(!is_admin(&s, &p(2)));
@@ -947,7 +1095,7 @@ mod tests {
     #[test]
     fn remove_admin_nonexistent_principal_is_noop_not_error() {
         let mut s = fresh_state();
-        bootstrap_admin_impl(&mut s, p(1)).unwrap();
+        bootstrap_admin_impl(&mut s, true, p(1)).unwrap();
         add_admin_impl(&mut s, p(1), p(2)).unwrap();
         assert!(remove_admin_impl(&mut s, p(1), p(200)).is_ok());
         assert!(is_admin(&s, &p(1)) && is_admin(&s, &p(2)));
@@ -962,7 +1110,7 @@ mod tests {
         // ATTACK: a non-admin trying to write a fraudulent record directly
         // (bypassing the intended admin-gated back office).
         let mut s = fresh_state();
-        bootstrap_admin_impl(&mut s, p(1)).unwrap();
+        bootstrap_admin_impl(&mut s, true, p(1)).unwrap();
         let root_before = s.current_root;
         let err = submit_record_impl(&mut s, p(2), 42, "5".into(), 0, 1, 999).unwrap_err();
         assert!(err.contains("unauthorized"));
@@ -972,7 +1120,7 @@ mod tests {
     #[test]
     fn submit_record_by_admin_succeeds_and_changes_root() {
         let mut s = fresh_state();
-        bootstrap_admin_impl(&mut s, p(1)).unwrap();
+        bootstrap_admin_impl(&mut s, true, p(1)).unwrap();
         let root_before = s.current_root;
         let root_after = submit_record_impl(&mut s, p(1), 42, "5".into(), 0, 1, 999).unwrap();
         assert_ne!(fe_to_string(root_before), root_after);
@@ -984,7 +1132,7 @@ mod tests {
         // ATTACK/robustness: non-numeric owner_commitment must not be
         // silently accepted or panic the call.
         let mut s = fresh_state();
-        bootstrap_admin_impl(&mut s, p(1)).unwrap();
+        bootstrap_admin_impl(&mut s, true, p(1)).unwrap();
         let err = submit_record_impl(&mut s, p(1), 42, "not-a-number".into(), 0, 1, 999).unwrap_err();
         assert!(err.contains("could not parse"));
     }
@@ -992,7 +1140,7 @@ mod tests {
     #[test]
     fn submit_record_resubmission_updates_leaf_in_place_not_appended() {
         let mut s = fresh_state();
-        bootstrap_admin_impl(&mut s, p(1)).unwrap();
+        bootstrap_admin_impl(&mut s, true, p(1)).unwrap();
         let r1 = submit_record_impl(&mut s, p(1), 42, "5".into(), 0, 1, 999).unwrap();
         // Resubmitting identical values must land on the SAME leaf index,
         // not silently grow the tree / shift other leaves' positions.
@@ -1004,7 +1152,7 @@ mod tests {
     #[test]
     fn submit_record_two_distinct_properties_get_distinct_leaf_indices() {
         let mut s = fresh_state();
-        bootstrap_admin_impl(&mut s, p(1)).unwrap();
+        bootstrap_admin_impl(&mut s, true, p(1)).unwrap();
         submit_record_impl(&mut s, p(1), 42, "5".into(), 0, 1, 999).unwrap();
         submit_record_impl(&mut s, p(1), 43, "6".into(), 0, 1, 999).unwrap();
         assert_eq!(s.next_leaf_index, 2);
@@ -1016,7 +1164,7 @@ mod tests {
         // ATTACK/robustness: updating property A must not corrupt property
         // B's leaf or its Merkle path.
         let mut s = fresh_state();
-        bootstrap_admin_impl(&mut s, p(1)).unwrap();
+        bootstrap_admin_impl(&mut s, true, p(1)).unwrap();
         submit_record_impl(&mut s, p(1), 42, "5".into(), 0, 1, 999).unwrap();
         submit_record_impl(&mut s, p(1), 43, "6".into(), 0, 1, 999).unwrap();
         let proof_43_before = get_merkle_proof_impl(&s, 43).unwrap();
@@ -1046,7 +1194,7 @@ mod tests {
     #[test]
     fn get_record_known_returns_data() {
         let mut s = fresh_state();
-        bootstrap_admin_impl(&mut s, p(1)).unwrap();
+        bootstrap_admin_impl(&mut s, true, p(1)).unwrap();
         submit_record_impl(&mut s, p(1), 42, "5".into(), 0, 1, 999).unwrap();
         let rec = get_record_impl(&s, 42).unwrap();
         assert_eq!(rec.property_id, 42);
@@ -1066,7 +1214,7 @@ mod tests {
         // the canister uses, and confirm it equals the stored root -- this
         // is exactly what a real prover depends on being true.
         let mut s = fresh_state();
-        bootstrap_admin_impl(&mut s, p(1)).unwrap();
+        bootstrap_admin_impl(&mut s, true, p(1)).unwrap();
         submit_record_impl(&mut s, p(1), 42, "5".into(), 0, 1, 999).unwrap();
         let rec = get_record_impl(&s, 42).unwrap();
         let proof = get_merkle_proof_impl(&s, 42).unwrap();
@@ -1118,7 +1266,7 @@ mod tests {
     #[test]
     fn request_challenge_captures_current_root_snapshot() {
         let mut s = fresh_state();
-        bootstrap_admin_impl(&mut s, p(1)).unwrap();
+        bootstrap_admin_impl(&mut s, true, p(1)).unwrap();
         submit_record_impl(&mut s, p(1), 42, "5".into(), 0, 1, 999).unwrap();
         let view = request_challenge_impl(&mut s, p(2), 1_000_000_000, 1).unwrap();
         assert_eq!(view.merkle_root, fe_to_string(s.current_root));
@@ -1161,10 +1309,10 @@ mod tests {
         let mut s = fresh_state();
         let view = request_challenge_impl(&mut s, p(1), 1_000_000_000, 1).unwrap();
         let root = s.current_root;
-        let inputs = vpi(root, view.request_nonce, view.current_timestamp, "n1");
+        let inputs = vpi(root, view.request_nonce, view.current_timestamp, "1");
         let t2 = 1_000_000_000 + MIN_CALL_INTERVAL_NS;
         verify_precheck_impl(&mut s, p(1), t2, view.challenge_id, &inputs).unwrap();
-        verify_commit_impl(&mut s, view.challenge_id, "n1").unwrap();
+        verify_commit_impl(&mut s, view.challenge_id, "1").unwrap();
 
         let t3 = t2 + MIN_CALL_INTERVAL_NS;
         let err = verify_precheck_impl(&mut s, p(1), t3, view.challenge_id, &inputs).unwrap_err();
@@ -1176,7 +1324,7 @@ mod tests {
         let mut s = fresh_state();
         let view = request_challenge_impl(&mut s, p(1), 1_000_000_000, 1).unwrap();
         let root = s.current_root;
-        let inputs = vpi(root, view.request_nonce, view.current_timestamp, "n1");
+        let inputs = vpi(root, view.request_nonce, view.current_timestamp, "1");
         let after_expiry = view.expires_at + 1;
         let err = verify_precheck_impl(&mut s, p(1), after_expiry, view.challenge_id, &inputs).unwrap_err();
         assert!(err.contains("expired"));
@@ -1187,7 +1335,7 @@ mod tests {
         let mut s = fresh_state();
         let view = request_challenge_impl(&mut s, p(1), 1_000_000_000, 1).unwrap();
         let root = s.current_root;
-        let mut inputs = vpi(root, view.request_nonce, view.current_timestamp, "n1");
+        let mut inputs = vpi(root, view.request_nonce, view.current_timestamp, "1");
         inputs.registry_id = 999;
         let err = verify_precheck_impl(&mut s, p(1), 1_000_000_000 + 1, view.challenge_id, &inputs).unwrap_err();
         assert!(err.contains("registry_id"));
@@ -1200,7 +1348,7 @@ mod tests {
         let mut s = fresh_state();
         let view = request_challenge_impl(&mut s, p(1), 1_000_000_000, 1).unwrap();
         let wrong_root = BaseElement::new(999_999_999);
-        let inputs = vpi(wrong_root, view.request_nonce, view.current_timestamp, "n1");
+        let inputs = vpi(wrong_root, view.request_nonce, view.current_timestamp, "1");
         let err = verify_precheck_impl(&mut s, p(1), 1_000_000_000 + 1, view.challenge_id, &inputs).unwrap_err();
         assert!(err.contains("merkle_root"));
     }
@@ -1213,7 +1361,7 @@ mod tests {
         let mut s = fresh_state();
         let view = request_challenge_impl(&mut s, p(1), 1_000_000_000, 1).unwrap();
         let root = s.current_root;
-        let mut inputs = vpi(root, view.request_nonce, view.current_timestamp, "n1");
+        let mut inputs = vpi(root, view.request_nonce, view.current_timestamp, "1");
         inputs.purpose = 2;
         let err = verify_precheck_impl(&mut s, p(1), 1_000_000_000 + 1, view.challenge_id, &inputs).unwrap_err();
         assert!(err.contains("purpose"));
@@ -1229,7 +1377,7 @@ mod tests {
         let t2 = 1_000_000_000 + MIN_CALL_INTERVAL_NS;
         let view_b = request_challenge_impl(&mut s, p(2), t2, 1).unwrap();
         let root = s.current_root;
-        let inputs_from_a = vpi(root, view_a.request_nonce, view_a.current_timestamp, "n1");
+        let inputs_from_a = vpi(root, view_a.request_nonce, view_a.current_timestamp, "1");
 
         let t3 = t2 + MIN_CALL_INTERVAL_NS;
         // caller must be view_b's own requester (p(2)) to get past the
@@ -1244,7 +1392,7 @@ mod tests {
         let mut s = fresh_state();
         let view = request_challenge_impl(&mut s, p(1), 1_000_000_000, 1).unwrap();
         let root = s.current_root;
-        let mut inputs = vpi(root, view.request_nonce, view.current_timestamp, "n1");
+        let mut inputs = vpi(root, view.request_nonce, view.current_timestamp, "1");
         inputs.current_timestamp += 1;
         let err = verify_precheck_impl(&mut s, p(1), 1_000_000_000 + 1, view.challenge_id, &inputs).unwrap_err();
         assert!(err.contains("current_timestamp"));
@@ -1258,14 +1406,14 @@ mod tests {
         let mut s = fresh_state();
         let view1 = request_challenge_impl(&mut s, p(1), 1_000_000_000, 1).unwrap();
         let root = s.current_root;
-        let inputs1 = vpi(root, view1.request_nonce, view1.current_timestamp, "SAME_NULLIFIER");
+        let inputs1 = vpi(root, view1.request_nonce, view1.current_timestamp, "424242");
         let t2 = 1_000_000_000 + MIN_CALL_INTERVAL_NS;
         verify_precheck_impl(&mut s, p(1), t2, view1.challenge_id, &inputs1).unwrap();
-        verify_commit_impl(&mut s, view1.challenge_id, "SAME_NULLIFIER").unwrap();
+        verify_commit_impl(&mut s, view1.challenge_id, "424242").unwrap();
 
         let t3 = t2 + MIN_CALL_INTERVAL_NS;
         let view2 = request_challenge_impl(&mut s, p(3), t3, 1).unwrap();
-        let inputs2 = vpi(root, view2.request_nonce, view2.current_timestamp, "SAME_NULLIFIER");
+        let inputs2 = vpi(root, view2.request_nonce, view2.current_timestamp, "424242");
         let t4 = t3 + MIN_CALL_INTERVAL_NS;
         // caller must be view2's own requester (p(3)) to get past the
         // front-running guard and reach the nullifier double-spend check
@@ -1283,7 +1431,7 @@ mod tests {
         let mut s = fresh_state();
         let view = request_challenge_impl(&mut s, p(1), 1_000_000_000, 1).unwrap();
         let root = s.current_root;
-        let inputs = vpi(root, view.request_nonce, view.current_timestamp, "n1");
+        let inputs = vpi(root, view.request_nonce, view.current_timestamp, "1");
         let err = verify_precheck_impl(&mut s, p(2), 1_000_000_000 + 1, view.challenge_id, &inputs).unwrap_err();
         assert!(err.contains("does not match"));
     }
@@ -1295,7 +1443,7 @@ mod tests {
         let mut s = fresh_state();
         let view = request_challenge_impl(&mut s, p(1), 1_000_000_000, 1).unwrap();
         let root = s.current_root;
-        let inputs = vpi(root, view.request_nonce, view.current_timestamp, "n1");
+        let inputs = vpi(root, view.request_nonce, view.current_timestamp, "1");
         assert!(verify_precheck_impl(&mut s, p(1), 1_000_000_000 + 1, view.challenge_id, &inputs).is_ok());
     }
 
@@ -1304,7 +1452,7 @@ mod tests {
         let mut s = fresh_state();
         let view = request_challenge_impl(&mut s, p(1), 1_000_000_000, 1).unwrap();
         let root = s.current_root;
-        let inputs = vpi(root, view.request_nonce, view.current_timestamp, "n1");
+        let inputs = vpi(root, view.request_nonce, view.current_timestamp, "1");
         let err = verify_precheck_impl(&mut s, Principal::anonymous(), 1_000_000_000 + 1, view.challenge_id, &inputs)
             .unwrap_err();
         assert!(err.contains("anonymous"));
@@ -1317,7 +1465,7 @@ mod tests {
         let mut s = fresh_state();
         let view = request_challenge_impl(&mut s, p(1), 1_000_000_000, 1).unwrap();
         let root = s.current_root;
-        let inputs = vpi(root, view.request_nonce, view.current_timestamp, "n1");
+        let inputs = vpi(root, view.request_nonce, view.current_timestamp, "1");
         verify_precheck_impl(&mut s, p(1), 1_000_000_000 + 1, view.challenge_id, &inputs).unwrap();
         let err = verify_precheck_impl(&mut s, p(1), 1_000_000_000 + 2, view.challenge_id, &inputs).unwrap_err();
         assert!(err.contains("rate limit"));
@@ -1330,7 +1478,7 @@ mod tests {
         let mut s = fresh_state();
         let view = request_challenge_impl(&mut s, p(1), 1_000_000_000, 1).unwrap();
         let root = s.current_root;
-        let mut inputs = vpi(root, view.request_nonce, view.current_timestamp, "n1");
+        let mut inputs = vpi(root, view.request_nonce, view.current_timestamp, "1");
         inputs.merkle_root = "'; DROP TABLE registry; --".to_string();
         let err = verify_precheck_impl(&mut s, p(1), 1_000_000_000 + 1, view.challenge_id, &inputs).unwrap_err();
         assert!(err.contains("could not parse"));
@@ -1437,7 +1585,7 @@ mod tests {
             let junk_len = 1 + (rng.next_u64() % 64) as usize;
             let junk = rng.bytes(junk_len);
             let s_lossy = String::from_utf8_lossy(&junk).to_string();
-            let mut inputs = vpi(BaseElement::ZERO, view.request_nonce, view.current_timestamp, "n1");
+            let mut inputs = vpi(BaseElement::ZERO, view.request_nonce, view.current_timestamp, "1");
             inputs.merkle_root = s_lossy.clone();
             inputs.nullifier = s_lossy;
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1572,18 +1720,18 @@ mod tests {
     fn verify_commit_marks_challenge_consumed_and_nullifier_spent() {
         let mut s = fresh_state();
         let view = request_challenge_impl(&mut s, p(1), 1_000_000_000, 1).unwrap();
-        let ok = verify_commit_impl(&mut s, view.challenge_id, "n1").unwrap();
-        assert_eq!(ok.nullifier, "n1");
+        let ok = verify_commit_impl(&mut s, view.challenge_id, "1").unwrap();
+        assert_eq!(ok.nullifier, "1");
         assert!(s.challenges.get(&view.challenge_id).unwrap().consumed);
-        assert!(*s.nullifiers.get("n1").unwrap());
+        assert!(*s.nullifiers.get("1").unwrap());
     }
 
     #[test]
     fn verify_commit_rejects_already_spent_nullifier_defense_in_depth() {
         let mut s = fresh_state();
         let view = request_challenge_impl(&mut s, p(1), 1_000_000_000, 1).unwrap();
-        verify_commit_impl(&mut s, view.challenge_id, "n1").unwrap();
-        let err = verify_commit_impl(&mut s, view.challenge_id, "n1").unwrap_err();
+        verify_commit_impl(&mut s, view.challenge_id, "1").unwrap();
+        let err = verify_commit_impl(&mut s, view.challenge_id, "1").unwrap_err();
         assert!(err.contains("nullifier already spent"));
     }
 
@@ -1598,7 +1746,7 @@ mod tests {
         let mut s = fresh_state();
         let view = request_challenge_impl(&mut s, p(1), 1_000_000_000, 1).unwrap();
         let root = s.current_root;
-        let inputs = vpi(root, view.request_nonce, view.current_timestamp, "n1");
+        let inputs = vpi(root, view.request_nonce, view.current_timestamp, "1");
 
         verify_precheck_impl(&mut s, p(1), 1_000_000_000 + 1, view.challenge_id, &inputs).unwrap();
         let crypto_result = verify_crypto_impl(&inputs, b"garbage-not-a-real-proof");
@@ -1606,7 +1754,7 @@ mod tests {
 
         // state must be completely untouched by the failed attempt
         assert!(!s.challenges.get(&view.challenge_id).unwrap().consumed);
-        assert!(s.nullifiers.get("n1").is_none());
+        assert!(s.nullifiers.get("1").is_none());
 
         // a legitimate retry against the SAME challenge must still be
         // possible (only the precheck phase is re-run here; the commit
@@ -1705,23 +1853,26 @@ mod tests {
     #[test]
     fn throttle_rejects_anonymous() {
         let mut store = HashMap::new();
-        let err = check_and_update_throttle(&mut store, Principal::anonymous(), 0).unwrap_err();
+        let mut log = VecDeque::new();
+        let err = check_and_update_throttle(&mut store, &mut log, Principal::anonymous(), 0).unwrap_err();
         assert!(err.contains("anonymous"));
     }
 
     #[test]
     fn throttle_rejects_rapid_repeat_from_same_caller() {
         let mut store = HashMap::new();
-        check_and_update_throttle(&mut store, p(1), 1000).unwrap();
-        let err = check_and_update_throttle(&mut store, p(1), 1000 + MIN_CALL_INTERVAL_NS - 1).unwrap_err();
+        let mut log = VecDeque::new();
+        check_and_update_throttle(&mut store, &mut log, p(1), 1000).unwrap();
+        let err = check_and_update_throttle(&mut store, &mut log, p(1), 1000 + MIN_CALL_INTERVAL_NS - 1).unwrap_err();
         assert!(err.contains("rate limit"));
     }
 
     #[test]
     fn throttle_allows_call_exactly_at_interval_boundary() {
         let mut store = HashMap::new();
-        check_and_update_throttle(&mut store, p(1), 1000).unwrap();
-        assert!(check_and_update_throttle(&mut store, p(1), 1000 + MIN_CALL_INTERVAL_NS).is_ok());
+        let mut log = VecDeque::new();
+        check_and_update_throttle(&mut store, &mut log, p(1), 1000).unwrap();
+        assert!(check_and_update_throttle(&mut store, &mut log, p(1), 1000 + MIN_CALL_INTERVAL_NS).is_ok());
     }
 
     #[test]
@@ -1729,8 +1880,64 @@ mod tests {
         // ATTACK-adjacent: one caller's rapid calls must not throttle a
         // DIFFERENT, innocent caller (no shared/global rate limit).
         let mut store = HashMap::new();
-        check_and_update_throttle(&mut store, p(1), 1000).unwrap();
-        assert!(check_and_update_throttle(&mut store, p(2), 1001).is_ok());
+        let mut log = VecDeque::new();
+        check_and_update_throttle(&mut store, &mut log, p(1), 1000).unwrap();
+        assert!(check_and_update_throttle(&mut store, &mut log, p(2), 1001).is_ok());
+    }
+
+    #[test]
+    fn throttle_log_is_pruned_after_retention_window_bounded_per_tick() {
+        // ATTACK: unbounded principal-keyed map growth. Before this fix,
+        // `last_challenge_call_at`/`last_verify_call_at` were never
+        // pruned at all -- since minting a fresh IC principal is free,
+        // this let a caller grow canister state without bound simply by
+        // calling from a new principal each time. Confirms: (a) entries
+        // older than THROTTLE_RETENTION_NS actually get removed, (b) a
+        // single heartbeat tick still respects a per-tick bound (same
+        // discipline as challenge pruning), and (c) an entry that's been
+        // legitimately refreshed by a newer call from the same principal
+        // is never evicted out from under it.
+        let mut s = fresh_state();
+        let mut now = 1_000_000_000i64;
+        let total = MAX_PRUNE_PER_HEARTBEAT + 10;
+        for i in 0..total {
+            request_challenge_impl(&mut s, p((i % 250) as u8 + 1), now, 1).unwrap();
+            now += MIN_CALL_INTERVAL_NS;
+        }
+        assert_eq!(s.last_challenge_call_at.len() as u64, total);
+
+        let far_future = now + THROTTLE_RETENTION_NS + 1;
+        heartbeat_impl(&mut s, far_future);
+        let remaining_after_one_tick = s.last_challenge_call_at.len() as u64;
+        assert!(
+            remaining_after_one_tick >= 10,
+            "a single heartbeat tick must not prune more than MAX_PRUNE_PER_HEARTBEAT throttle entries"
+        );
+        assert!(remaining_after_one_tick < total, "at least one stale entry must have been pruned");
+
+        // Enough further ticks fully drain it.
+        for _ in 0..10 {
+            heartbeat_impl(&mut s, far_future);
+        }
+        assert!(s.last_challenge_call_at.is_empty());
+    }
+
+    #[test]
+    fn throttle_log_prune_never_evicts_a_refreshed_entry() {
+        let mut s = fresh_state();
+        request_challenge_impl(&mut s, p(1), 1_000_000_000, 1).unwrap();
+        // A second, later call from the SAME principal refreshes the
+        // map's timestamp for p(1).
+        let t2 = 1_000_000_000 + MIN_CALL_INTERVAL_NS;
+        request_challenge_impl(&mut s, p(1), t2, 1).unwrap();
+        assert_eq!(*s.last_challenge_call_at.get(&p(1)).unwrap(), t2);
+
+        // Pruning at a time where only the FIRST (now-stale, but
+        // superseded) log entry would qualify must not remove p(1)'s
+        // still-current, more recent entry.
+        let prune_at = 1_000_000_000 + THROTTLE_RETENTION_NS + 1;
+        heartbeat_impl(&mut s, prune_at);
+        assert_eq!(*s.last_challenge_call_at.get(&p(1)).unwrap(), t2);
     }
 
     // -------------------------------------------------------------
